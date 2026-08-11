@@ -126,6 +126,10 @@ public:
 	vector<NestedNotNullConstraint> GetNestedNotNullConstraints() const;
 	bool HasNullConstraintsInArrays() const;
 
+	//! Whether parquet columns should be resolved by field_id rather than by name. True only
+	//! for `id` mode tables whose schema is fully covered by field ids. Initializes the scan.
+	bool ResolvesByFieldId() const;
+
 protected:
 	//! Get the i-th expanded file
 	OpenFileInfo GetFile(idx_t i) const override;
@@ -201,6 +205,13 @@ protected:
 	// The schema containing the proper column identifiers, lazily loaded to avoid prematurely initializing the kernel
 	// scan
 	mutable vector<DeltaMultiFileColumnDefinition> lazy_loaded_schema;
+
+	// The table's column mapping mode, read from the snapshot metadata alongside lazy_loaded_schema
+	mutable DeltaColumnMappingMode column_mapping_mode = DeltaColumnMappingMode::NONE;
+
+	// Whether lazy_loaded_schema carries field_id identifiers for every column, so the reader
+	// can match parquet columns by field_id instead of by name
+	mutable bool resolve_by_field_id = false;
 };
 
 // Callback for the ffi::kernel_scan_data_next callback
