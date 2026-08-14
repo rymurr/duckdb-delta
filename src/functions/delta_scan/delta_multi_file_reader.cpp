@@ -107,18 +107,13 @@ bool DeltaMultiFileReader::Bind(MultiFileOptions &options, MultiFileList &files,
                                 vector<Identifier> &names, MultiFileReaderBindData &bind_data) {
 	auto &delta_snapshot = dynamic_cast<DeltaMultiFileList &>(files);
 
-	auto log_tail_setting = options.custom_options.find("log_tail");
-	if (log_tail_setting != options.custom_options.end()) {
-		delta_snapshot.delta_log_path = make_uniq<DeltaLogPathArray>(log_tail_setting->second);
-	}
-
 	// MultiFileBind constructs the file list before parsing named parameters, so a `version => N`
 	// captured by ParseOption (and stashed on the reader as `requested_version`) cannot be passed
 	// to DeltaMultiFileList's constructor. Transfer it here, before delta_snapshot.Bind() triggers
 	// snapshot initialization. If a snapshot was injected via function_info (catalog-driven path),
 	// `snapshot` is non-null and PinVersion would have nothing to do, so we skip it.
-	if (!snapshot && requested_version != DConstants::INVALID_INDEX) {
-		delta_snapshot.PinVersion(requested_version);
+	if (!snapshot && !requested.IsLatest()) {
+		delta_snapshot.Pin(requested);
 	}
 
 	delta_snapshot.Bind(return_types, names);
@@ -328,11 +323,6 @@ bool DeltaMultiFileReader::ParseOption(const Identifier &key, const Value &val, 
 		return true;
 	}
 
-	if (key == "log_tail") {
-		options.custom_options["log_tail"] = val;
-		return true;
-	}
-
 	// We need to capture this one to know whether to emit
 	if (key == "pushdown_filters") {
 		options.custom_options["pushdown_filters"] = val;
@@ -340,7 +330,19 @@ bool DeltaMultiFileReader::ParseOption(const Identifier &key, const Value &val, 
 	}
 
 	if (key == "version") {
-		requested_version = val.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>();
+		if (!requested.IsLatest()) {
+			throw InvalidInputException("delta_scan: 'version' and 'timestamp' are mutually exclusive");
+		}
+		requested = DeltaTimeTravelSpec::FromVersion(val.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>());
+		return true;
+	}
+
+	if (key == "timestamp") {
+		if (!requested.IsLatest()) {
+			throw InvalidInputException("delta_scan: 'version' and 'timestamp' are mutually exclusive");
+		}
+		requested =
+		    DeltaTimeTravelSpec::FromTimestamp(val.DefaultCastAs(LogicalType::TIMESTAMP_TZ).GetValue<timestamp_tz_t>());
 		return true;
 	}
 

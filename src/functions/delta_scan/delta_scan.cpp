@@ -112,8 +112,8 @@ TableFunctionSet DeltaFunctions::GetDeltaScanFunction(ExtensionLoader &loader) {
 
 		function.named_parameters["pushdown_partition_info"] = LogicalType::BOOLEAN;
 		function.named_parameters["pushdown_filters"] = LogicalType::VARCHAR;
-		function.named_parameters["log_tail"] = KernelUtils::GetLogPathType();
 		function.named_parameters["version"] = LogicalType::UBIGINT;
+		function.named_parameters["timestamp"] = LogicalType::TIMESTAMP_TZ;
 
 		function.SetName("delta_scan");
 	}

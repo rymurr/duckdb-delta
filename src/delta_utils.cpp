@@ -876,12 +876,15 @@ string DuckDBEngineError::KernelErrorEnumToString(ffi::KernelError err) {
 	                                           "InvalidCheckpoint",
 	                                           "LiteralExpressionTransformError",
 	                                           "CheckpointWriteError",
-	                                           "SchemaError"};
+	                                           "SchemaError",
+	                                           "LogHistoryError"};
 
-	static_assert(sizeof(KERNEL_ERROR_ENUM_STRINGS) / sizeof(char *) - 1 == (int)ffi::KernelError::SchemaError,
+	static constexpr int KERNEL_ERROR_ENUM_COUNT = (int)(sizeof(KERNEL_ERROR_ENUM_STRINGS) / sizeof(char *));
+
+	static_assert(KERNEL_ERROR_ENUM_COUNT - 1 == (int)ffi::KernelError::LogHistoryError,
 	              "KernelErrorEnumStrings mismatched with kernel");
 
-	if ((int)err < sizeof(KERNEL_ERROR_ENUM_STRINGS) / sizeof(char *)) {
+	if ((int)err < KERNEL_ERROR_ENUM_COUNT) {
 		return KERNEL_ERROR_ENUM_STRINGS[(int)err];
 	}
 
@@ -948,12 +951,6 @@ DeltaLogPathArray::DeltaLogPathArray(Value log_path) {
 
 ffi::LogPathArray DeltaLogPathArray::GetFFIPtr() {
 	return {log_entries.data(), log_entries.size()};
-}
-
-LogicalType KernelUtils::GetLogPathType() {
-	return LogicalType::LIST(LogicalType::STRUCT({{"file_name", LogicalType::VARCHAR},
-	                                              {"timestamp", LogicalType::BIGINT},
-	                                              {"file_size", LogicalType::UBIGINT}}));
 }
 
 ffi::KernelStringSlice KernelUtils::ToDeltaString(const string &str) {

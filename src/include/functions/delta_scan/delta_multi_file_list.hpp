@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include "delta_time_travel.hpp"
+
 #include "delta_functions.hpp"
 #include "delta_utils.hpp"
 #include "functions/delta_scan/delta_multi_file_list.hpp"
@@ -19,6 +21,10 @@
 #include "duckdb/planner/filter/expression_filter.hpp"
 
 namespace duckdb {
+
+//! Builds a kernel engine for a table path, applying the DuckDB secret matching that path. Callable
+//! before any snapshot exists, which is what the CREATE TABLE path needs.
+KernelExternEngine CreateDeltaEngine(ClientContext &context, const string &path);
 
 struct DeltaFileMetaData {
 	DeltaFileMetaData() {};
@@ -90,6 +96,16 @@ public:
 	string path;
 };
 
+//! A CHAR(n)/VARCHAR(n) width declared on a top-level column via `__CHAR_VARCHAR_TYPE_STRING` field metadata
+struct DeltaStringWidthBound {
+	//! Index into the table's top-level columns
+	idx_t column_index;
+	//! Verbatim metadata value, e.g. "char(5)". Empty when only a descendant of this column declares a width
+	string declared_type;
+	//! Bound in codepoints. Unset when the width sits on a field nested inside declared_type, e.g. "array<char(5)>"
+	optional_idx max_length;
+};
+
 //! The DeltaMultiFileList implements the MultiFileList API to allow injecting it into the regular DuckDB parquet scan
 class DeltaMultiFileList : public SimpleMultiFileList {
 	friend struct ScanDataCallBack;
@@ -119,12 +135,18 @@ public:
 	unique_ptr<NodeStatistics> GetCardinality(ClientContext &context) const override;
 	DeltaFileMetaData &GetMetaData(idx_t index) const;
 	idx_t GetVersion();
-	void PinVersion(idx_t v);
+	//! Pin what this list will read. A timestamp is resolved against the log when the snapshot is
+	//! built; a version is used as-is. Passing the whole spec is what keeps the two from both being set.
+	void Pin(const DeltaTimeTravelSpec &spec);
+	//! The version `timestamp` names, without building a snapshot at it. Reads only the log HEAD needs,
+	//! reusing the previous snapshot when this list was given one.
+	idx_t ResolveTimestampToVersion(timestamp_tz_t timestamp) const;
 	vector<string> GetPartitionColumns();
 
 	vector<DeltaMultiFileColumnDefinition> &GetLazyLoadedGlobalColumns() const;
 	vector<NestedNotNullConstraint> GetNestedNotNullConstraints() const;
 	bool HasNullConstraintsInArrays() const;
+	vector<DeltaStringWidthBound> GetStringWidthBounds() const;
 
 	//! Whether parquet columns should be resolved by field_id rather than by name. True only
 	//! for `id` mode tables whose schema is fully covered by field ids. Initializes the scan.
@@ -139,6 +161,17 @@ protected:
 	idx_t GetTotalFileCountInternal() const;
 	void InitializeSnapshot() const;
 	void InitializeScan() const;
+
+	//! Restates the kernel's catalog-managed refusal in terms the caller can act on
+	ffi::Handle<ffi::SharedSnapshot> BuildSnapshot(ffi::Handle<ffi::MutableFfiSnapshotBuilder> builder) const;
+
+	//! Builder for `target_version` (INVALID_INDEX for HEAD), with log tail and catalog bounds applied
+	ffi::Handle<ffi::MutableFfiSnapshotBuilder>
+	CreateSnapshotBuilder(ffi::KernelStringSlice path_slice, idx_t target_version, bool &using_incremental) const;
+
+	//! The version `timestamp_ms` names, adopting the HEAD snapshot built on the way when it already is
+	//! the answer. Requires extern_engine.
+	idx_t ResolveTimestamp(ClientContext &context, ffi::KernelStringSlice path_slice, int64_t timestamp_ms) const;
 
 	void EnsureSnapshotInitialized() const;
 	void EnsureScanInitialized() const;
@@ -169,6 +202,10 @@ protected:
 	mutable mutex lock;
 	mutable idx_t version;
 
+	//! Time travel by timestamp, in milliseconds since the unix epoch (the delta protocol's unit)
+	mutable bool has_requested_timestamp = false;
+	mutable int64_t requested_timestamp_ms = 0;
+
 	//! Delta Kernel Structures
 	mutable shared_ptr<SharedKernelSnapshot> old_snapshot;
 
@@ -192,6 +229,7 @@ protected:
 	mutable vector<OpenFileInfo> resolved_files;
 	mutable DeltaTableFilters table_filters;
 
+	mutable vector<DeltaStringWidthBound> string_width_bounds;
 	mutable vector<NestedNotNullConstraint> not_null_constraints;
 	mutable bool has_null_constraints_in_arrays = false;
 

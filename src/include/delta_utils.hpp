@@ -56,7 +56,6 @@ struct DeltaLogPathArray {
 enum class DeltaColumnMappingMode { NONE, ID, NAME };
 
 struct KernelUtils {
-	static LogicalType GetLogPathType();
 	static ffi::KernelStringSlice ToDeltaString(const string &str);
 	static string FromDeltaString(const struct ffi::KernelStringSlice slice);
 	static vector<bool> FromDeltaBoolSlice(const struct ffi::KernelBoolSlice slice);
@@ -332,6 +331,9 @@ struct DeltaMultiFileColumnDefinition : public MultiFileColumnDefinition {
 	//! `delta.columnMapping.physicalName`, retained so id-mode schemas can fall back to
 	//! name matching when they are not fully covered by field ids
 	Value physical_name;
+	//! Verbatim `__CHAR_VARCHAR_TYPE_STRING` field metadata, e.g. "char(5)" or "array<varchar(5)>": a width the Delta
+	//! type system cannot express, which Spark enforces client-side and the kernel does not interpret at all.
+	string char_varchar_type;
 };
 
 // KernelSchemaVisitor is used to parse the schema of a Delta table from the Kernel
@@ -399,6 +401,7 @@ private:
 		case DeltaColumnMappingMode::NONE:
 			break;
 		}
+		col_def.char_varchar_type = KernelUtils::FetchFromStringMap(engine, metadata, "__CHAR_VARCHAR_TYPE_STRING");
 		col_def.default_expression = make_uniq<ConstantExpression>(Value(col_def.type));
 	}
 

@@ -1,8 +1,12 @@
 #include "functions/delta_scan/delta_scan.hpp"
 #include "functions/delta_scan/delta_multi_file_list.hpp"
 #include "functions/delta_scan/delta_multi_file_reader.hpp"
+#include "storage/delta_catalog.hpp"
 
 #include "duckdb/common/local_file_system.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
+#include "duckdb/common/operator/multiply.hpp"
+#include "duckdb/common/types/interval.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_data.hpp"
@@ -336,6 +340,16 @@ static ffi::EngineBuilder *CreateBuilder(ClientContext &context, const string &p
 	return builder;
 }
 
+KernelExternEngine CreateDeltaEngine(ClientContext &context, const string &path) {
+	auto interface_builder = CreateBuilder(context, path);
+	ffi::SharedExternEngine *engine;
+	auto res = KernelUtils::TryUnpackResult(ffi::builder_build(interface_builder), engine);
+	if (res.HasError()) {
+		res.Throw();
+	}
+	return KernelExternEngine(engine);
+}
+
 struct KernelPartitionVisitorData {
 	vector<string> partitions;
 	ErrorData err_data;
@@ -588,6 +602,65 @@ string DeltaMultiFileList::ToDeltaPath(const string &raw_path) {
 	return path;
 }
 
+//! Only a bare "char(n)"/"varchar(n)" bounds the field itself. Anything else wraps the width in a nested type, and
+//! stays unset so callers refuse the write instead of ignoring the bound.
+static optional_idx ParseCharVarcharWidth(const string &declared_type) {
+	auto lower = StringUtil::Lower(declared_type);
+	string prefix;
+	if (StringUtil::StartsWith(lower, "char(")) {
+		prefix = "char(";
+	} else if (StringUtil::StartsWith(lower, "varchar(")) {
+		prefix = "varchar(";
+	} else {
+		return optional_idx();
+	}
+	if (lower.back() != ')') {
+		return optional_idx();
+	}
+	auto digits = lower.substr(prefix.size(), lower.size() - prefix.size() - 1);
+	if (digits.empty()) {
+		return optional_idx();
+	}
+	for (const auto c : digits) {
+		if (!StringUtil::CharacterIsDigit(c)) {
+			return optional_idx();
+		}
+	}
+	idx_t width;
+	if (!TryCast::Operation<string_t, idx_t>(string_t(digits), width) || width == 0) {
+		return optional_idx();
+	}
+	return optional_idx(width);
+}
+
+static bool HasNestedCharVarcharType(const vector<DeltaMultiFileColumnDefinition> &columns) {
+	for (auto &col : columns) {
+		if (!col.char_varchar_type.empty() || HasNestedCharVarcharType(col.children)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void ExtractStringWidthBounds(vector<DeltaStringWidthBound> &bounds,
+                                     const vector<DeltaMultiFileColumnDefinition> &columns) {
+	for (idx_t col_id = 0; col_id < columns.size(); col_id++) {
+		auto &col = columns[col_id];
+		auto nested = HasNestedCharVarcharType(col.children);
+		if (col.char_varchar_type.empty() && !nested) {
+			continue;
+		}
+
+		DeltaStringWidthBound bound;
+		bound.column_index = col_id;
+		bound.declared_type = col.char_varchar_type;
+		if (!nested && col.type.id() == LogicalTypeId::VARCHAR) {
+			bound.max_length = ParseCharVarcharWidth(col.char_varchar_type);
+		}
+		bounds.push_back(std::move(bound));
+	}
+}
+
 static void ExtractNotNullConstraints(vector<NestedNotNullConstraint> &constraints,
                                       const vector<DeltaMultiFileColumnDefinition> &columns,
                                       idx_t index = DConstants::INVALID_INDEX, const string &parent_path = "") {
@@ -659,8 +732,8 @@ void DeltaMultiFileList::Bind(vector<LogicalType> &return_types, vector<Identifi
 	have_bound = true;
 
 	ExtractNotNullConstraints(this->not_null_constraints, visited_schema);
-
 	has_null_constraints_in_arrays = ExtractHasNullConstraintsInArrays(visited_schema);
+	ExtractStringWidthBounds(this->string_width_bounds, visited_schema);
 
 	this->global_columns = std::move(visited_schema);
 }
@@ -717,50 +790,146 @@ OpenFileInfo DeltaMultiFileList::GetFile(idx_t i) const {
 	return GetFileInternal(i);
 }
 
+// Kernel refuses a catalog-managed table without max_catalog_version -- its newest commit may be
+// catalog-tracked and not yet backfilled. Catch that kernel/API error, and rephrase it for users.
+// NOTE:  Text match, but it cannot rot unnoticed: the builder API this calls is gone post-v0.26, so
+// that bump breaks the build here before the match can go stale.
+ffi::Handle<ffi::SharedSnapshot>
+DeltaMultiFileList::BuildSnapshot(ffi::Handle<ffi::MutableFfiSnapshotBuilder> builder) const {
+	ffi::Handle<ffi::SharedSnapshot> built;
+	auto res = KernelUtils::TryUnpackResult(ffi::snapshot_builder_build(builder), built);
+	if (res.HasError()) {
+		if (StringUtil::Contains(res.RawMessage(), "Catalog-managed table requires max_catalog_version")) {
+			throw InvalidInputException(
+			    "Table at '%s' is a catalog-managed Delta table: reading it directly from storage would skip "
+			    "commits that are only tracked by the catalog. Attach the catalog that owns it instead (e.g. "
+			    "ATTACH '<catalog>' AS <name> (TYPE unity_catalog)) and query it through that catalog.",
+			    paths[0].path);
+		}
+		res.Throw();
+	}
+	return built;
+}
+
 // req: this.lock must already be owned
+ffi::Handle<ffi::MutableFfiSnapshotBuilder> DeltaMultiFileList::CreateSnapshotBuilder(ffi::KernelStringSlice path_slice,
+                                                                                      idx_t target_version,
+                                                                                      bool &using_incremental) const {
+	ffi::Handle<ffi::MutableFfiSnapshotBuilder> builder;
+	using_incremental = false;
+
+	if (old_snapshot) {
+		auto old_snapshot_ref = old_snapshot->GetLockingRef();
+		auto old_version = ffi::version(old_snapshot_ref.GetPtr());
+		if (target_version == DConstants::INVALID_INDEX || target_version >= old_version) {
+			// Going forward (or HEAD): use old snapshot as hint
+			using_incremental = true;
+			builder =
+			    TryUnpackKernelResult(ffi::get_snapshot_builder_from(old_snapshot_ref.GetPtr(), extern_engine.get()));
+		} else {
+			// Going backward: kernel rejects builder_from for older versions
+			builder = TryUnpackKernelResult(ffi::get_snapshot_builder(path_slice, extern_engine.get()));
+		}
+	} else {
+		builder = TryUnpackKernelResult(ffi::get_snapshot_builder(path_slice, extern_engine.get()));
+	}
+
+	if (target_version != DConstants::INVALID_INDEX) {
+		ffi::snapshot_builder_set_version(&builder, target_version);
+	}
+	if (delta_log_path) {
+		TryUnpackKernelResult(ffi::snapshot_builder_set_log_tail(&builder, delta_log_path->GetFFIPtr()));
+	}
+	if (max_catalog_version >= 0) {
+		ffi::snapshot_builder_set_max_catalog_version(&builder, static_cast<uint64_t>(max_catalog_version));
+	}
+
+	return builder;
+}
+
+//! Delta timestamps are epoch milliseconds; logs are for humans. The kernel supplies some of these,
+//! so an unrepresentable value falls back to the raw number rather than throwing out of a log call.
+static string FormatEpochMs(int64_t timestamp_ms) {
+	int64_t micros;
+	if (!TryMultiplyOperator::Operation(timestamp_ms, Interval::MICROS_PER_MSEC, micros)) {
+		return to_string(timestamp_ms) + "ms";
+	}
+	return Value::TIMESTAMPTZ(timestamp_tz_t(micros)).ToString();
+}
+
+// req: this.lock must already be owned
+idx_t DeltaMultiFileList::ResolveTimestamp(ClientContext &context, ffi::KernelStringSlice path_slice,
+                                           int64_t timestamp_ms) const {
+	// The kernel searches the version range the snapshot spans, so a HEAD snapshot has to exist before
+	// the timestamp can name anything. Seeded from old_snapshot when there is one, so this reads only
+	// the commits after it rather than replaying the whole log.
+	bool using_incremental = false;
+	auto head_builder = CreateSnapshotBuilder(path_slice, DConstants::INVALID_INDEX, using_incremental);
+	auto head = make_shared_ptr<SharedKernelSnapshot>(BuildSnapshot(head_builder));
+
+	idx_t head_version;
+	ffi::FfiCommitAt commit;
+	{
+		auto head_ref = head->GetLockingRef();
+		head_version = ffi::version(head_ref.GetPtr());
+		commit = TryUnpackKernelResult(ffi::latest_version_as_of(head_ref.GetPtr(), extern_engine.get(), timestamp_ms,
+		                                                         ffi::FfiHistoryCommitType::Recreatable));
+	}
+	auto resolved = static_cast<idx_t>(commit.version);
+
+	// The commit's own timestamp is what makes this readable after the fact: it is the gap between what
+	// was asked for and what was read, and it says whether the table has in-commit timestamps (exact)
+	// or is falling back to file modification times (approximate).
+	DUCKDB_LOG_INTERNAL(context, "delta.TimeTravel", LogLevel::LOG_DEBUG,
+	                    "Timestamp %s resolved to version %s committed at %s; head is version %s "
+	                    "(incremental=%s) for '%s'",
+	                    FormatEpochMs(timestamp_ms), to_string(resolved), FormatEpochMs(commit.timestamp),
+	                    to_string(head_version), using_incremental ? "true" : "false",
+	                    string(path_slice.ptr, path_slice.len));
+
+	if (resolved == head_version) {
+		snapshot = std::move(head);
+	}
+	return resolved;
+}
+
+idx_t DeltaMultiFileList::ResolveTimestampToVersion(timestamp_tz_t timestamp) const {
+	unique_lock<mutex> lck(lock);
+	if (initialized_snapshot) {
+		throw InternalException("DeltaMultiFileList::ResolveTimestampToVersion called after the snapshot was "
+		                        "initialized");
+	}
+	D_ASSERT(!client_ctx.expired());
+	auto client_ctx_shared = client_ctx.lock();
+	auto path_slice = KernelUtils::ToDeltaString(paths[0].path);
+
+	extern_engine = CreateDeltaEngine(*client_ctx_shared, paths[0].path);
+	version = ResolveTimestamp(*client_ctx_shared, path_slice, DeltaTimestampToEpochMs(timestamp));
+	return version;
+}
+
 void DeltaMultiFileList::InitializeSnapshot() const {
 	// D_ASSERT(lock.is_locked())  -- no such check available; could use recursive mutex
 	D_ASSERT(!client_ctx.expired());
 	auto client_ctx_shared = client_ctx.lock();
 	auto path_slice = KernelUtils::ToDeltaString(paths[0].path);
 
-	auto interface_builder = CreateBuilder(*client_ctx_shared, paths[0].path);
-	extern_engine = TryUnpackKernelResult(ffi::builder_build(interface_builder));
+	extern_engine = CreateDeltaEngine(*client_ctx_shared, paths[0].path);
+
+	if (!snapshot && has_requested_timestamp) {
+		version = ResolveTimestamp(*client_ctx_shared, path_slice, requested_timestamp_ms);
+	}
 
 	if (!snapshot) {
-		ffi::Handle<ffi::MutableFfiSnapshotBuilder> builder;
 		bool using_incremental = false;
-		if (old_snapshot) {
-			auto old_snapshot_ref = old_snapshot->GetLockingRef();
-			auto old_version = ffi::version(old_snapshot_ref.GetPtr());
-			if (version == DConstants::INVALID_INDEX || version >= old_version) {
-				// Going forward (or HEAD): use old snapshot as hint
-				using_incremental = true;
-				builder = TryUnpackKernelResult(
-				    ffi::get_snapshot_builder_from(old_snapshot_ref.GetPtr(), extern_engine.get()));
-			} else {
-				// Going backward: kernel rejects builder_from for older versions
-				builder = TryUnpackKernelResult(ffi::get_snapshot_builder(path_slice, extern_engine.get()));
-			}
-		} else {
-			builder = TryUnpackKernelResult(ffi::get_snapshot_builder(path_slice, extern_engine.get()));
-		}
+		auto builder = CreateSnapshotBuilder(path_slice, version, using_incremental);
 
 		DUCKDB_LOG_INTERNAL(*client_ctx_shared, "delta.DeltaMultiFileList", LogLevel::LOG_DEBUG,
 		                    "Loading snapshot for '%s': version=%s, log_tail=%s, incremental=%s",
 		                    string(path_slice.ptr, path_slice.len),
 		                    version == DConstants::INVALID_INDEX ? "HEAD" : to_string(version),
 		                    delta_log_path ? "true" : "false", using_incremental ? "true" : "false");
-		if (version != DConstants::INVALID_INDEX) {
-			ffi::snapshot_builder_set_version(&builder, version);
-		}
-		if (delta_log_path) {
-			TryUnpackKernelResult(ffi::snapshot_builder_set_log_tail(&builder, delta_log_path->GetFFIPtr()));
-		}
-		if (max_catalog_version >= 0) {
-			ffi::snapshot_builder_set_max_catalog_version(&builder, static_cast<uint64_t>(max_catalog_version));
-		}
-		snapshot = make_shared_ptr<SharedKernelSnapshot>(TryUnpackKernelResult(ffi::snapshot_builder_build(builder)));
+		snapshot = make_shared_ptr<SharedKernelSnapshot>(BuildSnapshot(builder));
 
 		auto snapshot_ref = snapshot->GetLockingRef();
 		if (version == DConstants::INVALID_INDEX) {
@@ -1119,12 +1288,21 @@ idx_t DeltaMultiFileList::GetVersion() {
 	return version;
 }
 
-void DeltaMultiFileList::PinVersion(idx_t v) {
+void DeltaMultiFileList::Pin(const DeltaTimeTravelSpec &spec) {
 	unique_lock<mutex> lck(lock);
 	if (initialized_snapshot) {
-		throw InternalException("DeltaMultiFileList::PinVersion called after the snapshot was initialized");
+		throw InternalException("DeltaMultiFileList::Pin called after the snapshot was initialized");
 	}
-	version = v;
+	// Taking the whole spec at once is what keeps a version and a timestamp from both being set: one
+	// call, one kind, and the other is cleared.
+	if (spec.IsTimestamp()) {
+		version = DConstants::INVALID_INDEX;
+		has_requested_timestamp = true;
+		requested_timestamp_ms = DeltaTimestampToEpochMs(spec.GetTimestamp());
+	} else if (spec.IsVersion()) {
+		version = spec.GetVersion();
+		has_requested_timestamp = false;
+	}
 }
 
 DeltaFileMetaData &DeltaMultiFileList::GetMetaData(idx_t index) const {
@@ -1145,6 +1323,21 @@ vector<DeltaMultiFileColumnDefinition> &DeltaMultiFileList::GetLazyLoadedGlobalC
 	unique_lock<mutex> lck(lock);
 	EnsureScanInitialized();
 	return lazy_loaded_schema;
+}
+
+vector<DeltaStringWidthBound> DeltaMultiFileList::GetStringWidthBounds() const {
+	unique_lock<mutex> lck(lock);
+	EnsureSnapshotInitialized();
+	if (!have_bound) {
+		// Every table entry binds first, so this is unreachable today. Visit the schema anyway rather than fall
+		// through to an empty result: a width check that silently finds no bounds is the one failure we cannot see.
+		auto snapshot_ref = snapshot->GetLockingRef();
+		auto visited_schema = KernelSchemaVisitor::ToColumnDefinitions(extern_engine.get(), snapshot_ref.GetPtr());
+		vector<DeltaStringWidthBound> bounds;
+		ExtractStringWidthBounds(bounds, visited_schema);
+		return bounds;
+	}
+	return string_width_bounds;
 }
 
 vector<NestedNotNullConstraint> DeltaMultiFileList::GetNestedNotNullConstraints() const {
